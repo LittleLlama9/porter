@@ -1,0 +1,12 @@
+{
+  "idleMinutes": 10,
+  "apps": [
+    {
+      "name": "myapp",
+      "port": 3000,
+      "cmd": "node",
+      "args": ["server.js"],
+      "cwd": "C:\\path\\to\\myapp"
+    }
+  ]
+}
