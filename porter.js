@@ -23,6 +23,7 @@ const LOG_MAX_BYTES = 512 * 1024;
 
 const SPAWN_TIMEOUT_MS = 20_000;   // max wait for an app to start accepting
 const CONNECT_RETRY_MS = 250;
+const MANIFEST_NAME = 'porter.app.json';
 
 function log(msg) {
   const line = `${new Date().toISOString()} ${msg}\n`;
@@ -35,6 +36,114 @@ function log(msg) {
   } catch { /* logging must never kill the porter */ }
 }
 
+function normalizeApp(raw, idleMinutes, manifestPath = null) {
+  const name = String(raw.name || '').trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) {
+    throw new Error(`invalid app name "${raw.name || ''}"`);
+  }
+  const port = Number(raw.port);
+  const upstreamPort = Number(raw.upstreamPort ?? port + 10000);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`${name}: port must be an integer from 1 to 65535`);
+  }
+  if (!Number.isInteger(upstreamPort) || upstreamPort < 1 || upstreamPort > 65535) {
+    throw new Error(`${name}: upstreamPort must be an integer from 1 to 65535`);
+  }
+  if (port === upstreamPort) {
+    throw new Error(`${name}: port and upstreamPort must differ`);
+  }
+  if (typeof raw.cmd !== 'string' || !raw.cmd.trim()) {
+    throw new Error(`${name}: cmd is required`);
+  }
+  if (raw.args !== undefined && (!Array.isArray(raw.args) || raw.args.some(arg => typeof arg !== 'string'))) {
+    throw new Error(`${name}: args must be an array of strings`);
+  }
+  const cwd = manifestPath
+    ? path.dirname(manifestPath)
+    : String(raw.cwd || '').trim();
+  if (!cwd) throw new Error(`${name}: cwd is required`);
+  const env = raw.env ?? {};
+  if (!env || typeof env !== 'object' || Array.isArray(env)) {
+    throw new Error(`${name}: env must be an object`);
+  }
+  const appIdleMinutes = Number(raw.idleMinutes ?? idleMinutes);
+  if (!Number.isFinite(appIdleMinutes) || appIdleMinutes < 0) {
+    throw new Error(`${name}: idleMinutes must be zero or greater`);
+  }
+  return {
+    name,
+    port,
+    upstreamPort,
+    cmd: raw.cmd,
+    args: raw.args || [],
+    cwd,
+    env: Object.fromEntries(
+      Object.entries(env).map(([key, value]) => [key, String(value)]),
+    ),
+    idleMs: appIdleMinutes * 60_000,
+    manifestPath,
+    // runtime state
+    child: null,
+    starting: null,
+    sockets: new Set(),
+    idleTimer: null,
+    door: null,
+  };
+}
+
+function manifestFiles(root) {
+  const files = [];
+  const rootManifest = path.join(root, MANIFEST_NAME);
+  if (fs.existsSync(rootManifest)) files.push(rootManifest);
+  let entries = [];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch (err) {
+    log(`[manifest] cannot scan ${root}: ${err.message}`);
+    return files;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const manifest = path.join(root, entry.name, MANIFEST_NAME);
+    if (fs.existsSync(manifest)) files.push(manifest);
+  }
+  return files;
+}
+
+function discoverManifestApps(roots, idleMinutes) {
+  const apps = [];
+  for (const root of roots) {
+    for (const manifestPath of manifestFiles(root)) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        if (raw.enabled === false) continue;
+        apps.push(normalizeApp(raw, idleMinutes, manifestPath));
+      } catch (err) {
+        log(`[manifest] skipped ${manifestPath}: ${err.message}`);
+      }
+    }
+  }
+  return apps;
+}
+
+function addUniqueApp(apps, app) {
+  const conflict = apps.find(existing =>
+    existing.name === app.name
+    || [existing.port, existing.upstreamPort].includes(app.port)
+    || [existing.port, existing.upstreamPort].includes(app.upstreamPort)
+  );
+  if (!conflict) {
+    apps.push(app);
+    return true;
+  }
+  const source = app.manifestPath || 'porter.config.json';
+  log(
+    `[${app.name}] skipped ${source}: conflicts with ${conflict.name} `
+    + `(${conflict.port}->${conflict.upstreamPort})`,
+  );
+  return false;
+}
+
 function loadConfig() {
   if (!fs.existsSync(CONFIG_PATH)) {
     const example = path.join(__dirname, 'porter.config.example.json');
@@ -45,22 +154,27 @@ function loadConfig() {
   // namePort: the shared door that routes http://<name>.localhost/ by Host
   // header. Set to false in the config to disable.
   const namePort = raw.namePort === false ? null : (raw.namePort ?? 80);
-  const apps = (raw.apps || []).map(a => ({
-    name: a.name,
-    port: a.port,
-    upstreamPort: a.upstreamPort ?? a.port + 10000,
-    cmd: a.cmd,
-    args: a.args || [],
-    cwd: a.cwd,
-    env: a.env || {},
-    idleMs: (a.idleMinutes ?? idleMinutes) * 60_000,
-    // runtime state
-    child: null,
-    starting: null,     // promise while child is booting
-    sockets: new Set(),
-    idleTimer: null,
-  }));
-  return { apps, namePort };
+  const manifestRoots = (raw.manifestRoots || []).map(root =>
+    path.resolve(__dirname, root)
+  );
+  const manifestScanSeconds = Number(raw.manifestScanSeconds ?? 10);
+  if (!Number.isFinite(manifestScanSeconds) || manifestScanSeconds < 1) {
+    throw new Error('manifestScanSeconds must be at least 1');
+  }
+  const apps = [];
+  for (const rawApp of raw.apps || []) {
+    addUniqueApp(apps, normalizeApp(rawApp, idleMinutes));
+  }
+  for (const app of discoverManifestApps(manifestRoots, idleMinutes)) {
+    addUniqueApp(apps, app);
+  }
+  return {
+    apps,
+    namePort,
+    idleMinutes,
+    manifestRoots,
+    manifestScanMs: manifestScanSeconds * 1000,
+  };
 }
 
 function childAlive(app) {
@@ -91,7 +205,7 @@ async function waitForUpstream(app) {
 function startChild(app) {
   if (app.starting) return app.starting;
   if (childAlive(app)) return Promise.resolve();
-  app.starting = (async () => {
+  const starting = (async () => {
     log(`[${app.name}] spawning: ${app.cmd} ${app.args.join(' ')} (PORT=${app.upstreamPort})`);
     // child stdout/stderr go to logs/<name>.log — 'ignore' made every child
     // failure invisible (every child crash vanished without this)
@@ -108,7 +222,7 @@ function startChild(app) {
     } catch { /* fall back to ignore — logging must never block a spawn */ }
     app.child = spawn(app.cmd, app.args, {
       cwd: app.cwd,
-      env: { ...process.env, PORT: String(app.upstreamPort), ...app.env },
+      env: { ...process.env, ...app.env, PORT: String(app.upstreamPort) },
       windowsHide: true,
       stdio: childStdio,
       detached: false,
@@ -129,7 +243,7 @@ function startChild(app) {
     probe.destroy();
     log(`[${app.name}] up on :${app.upstreamPort}`);
   })();
-  app.starting.finally(() => { app.starting = null; });
+  app.starting = starting.finally(() => { app.starting = null; });
   return app.starting;
 }
 
@@ -177,6 +291,24 @@ function handleConnection(app, client, initialChunk) {
     });
 }
 
+function startAppDoor(app, apps) {
+  const server = net.createServer(socket => handleConnection(app, socket));
+  app.door = server;
+  server.on('error', err => {
+    if (err.code === 'EADDRINUSE') {
+      log(`[${app.name}] :${app.port} already in use — is the app (or another porter) running? skipping`);
+    } else {
+      log(`[${app.name}] listen error: ${err.message}`);
+    }
+    app.door = null;
+    const index = apps.indexOf(app);
+    if (index >= 0) apps.splice(index, 1);
+  });
+  server.listen(app.port, '127.0.0.1', () => {
+    log(`[${app.name}] door open on :${app.port} → :${app.upstreamPort} (idle ${app.idleMs / 60000}min)`);
+  });
+}
+
 // The name door: one listener (default :80) that reads the Host header off the
 // first chunk and routes http://<name>.localhost/ (or a bare hosts-file alias
 // http://<name>/) to the matching app. The chunk is replayed to the upstream,
@@ -217,25 +349,38 @@ function startNameDoor(apps, namePort) {
 }
 
 function main() {
-  const { apps, namePort } = loadConfig();
+  const {
+    apps,
+    namePort,
+    idleMinutes,
+    manifestRoots,
+    manifestScanMs,
+  } = loadConfig();
   if (apps.length === 0) {
-    log('no apps in porter.config.json — nothing to do');
-    process.exit(1);
+    log('no apps configured yet — waiting for manifests');
   }
   for (const app of apps) {
-    const server = net.createServer(socket => handleConnection(app, socket));
-    server.on('error', err => {
-      if (err.code === 'EADDRINUSE') {
-        log(`[${app.name}] :${app.port} already in use — is the app (or another porter) running? skipping`);
-      } else {
-        log(`[${app.name}] listen error: ${err.message}`);
-      }
-    });
-    server.listen(app.port, '127.0.0.1', () => {
-      log(`[${app.name}] door open on :${app.port} → :${app.upstreamPort} (idle ${app.idleMs / 60000}min)`);
-    });
+    startAppDoor(app, apps);
   }
   if (namePort) startNameDoor(apps, namePort);
+  if (manifestRoots.length > 0) {
+    const scan = () => {
+      for (const app of discoverManifestApps(manifestRoots, idleMinutes)) {
+        if (apps.some(existing => existing.manifestPath === app.manifestPath)) {
+          continue;
+        }
+        if (addUniqueApp(apps, app)) {
+          startAppDoor(app, apps);
+          log(`[${app.name}] discovered from ${app.manifestPath}`);
+        }
+      }
+    };
+    setInterval(scan, manifestScanMs);
+    log(
+      `[manifest] scanning ${manifestRoots.join(', ')} every `
+      + `${manifestScanMs / 1000}s`,
+    );
+  }
 
   const shutdown = () => {
     log('porter shutting down — stopping children');
@@ -258,4 +403,12 @@ process.on('unhandledRejection', reason => {
   process.exit(1);
 });
 
-main();
+const isMain = process.argv[1]
+  && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) main();
+
+export {
+  addUniqueApp,
+  discoverManifestApps,
+  normalizeApp,
+};

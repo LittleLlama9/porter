@@ -1,5 +1,9 @@
 {
   "idleMinutes": 10,
+  "manifestRoots": [
+    "C:\\path\\to\\projects"
+  ],
+  "manifestScanSeconds": 10,
   "apps": [
     {
       "name": "myapp",

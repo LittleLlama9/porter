@@ -33,8 +33,36 @@ Config is just a list of apps:
 }
 ```
 
+## Automatic app manifests
+
+Set `manifestRoots` to folders that contain your projects. Porter checks each
+root and its immediate child directories for `porter.app.json` at startup and
+every `manifestScanSeconds`. A new manifest opens its port and
+`http://<name>.localhost/` route without editing Porter's central config or
+restarting it.
+
+Example `porter.app.json` in an app's project root:
+
+```json
+{
+  "name": "myapp",
+  "port": 3000,
+  "cmd": "node",
+  "args": ["server.js"]
+}
+```
+
+The manifest directory becomes the app's working directory. Optional fields are
+`upstreamPort`, `env`, `idleMinutes`, and `enabled`. Names may contain lowercase
+letters, numbers, and hyphens. Ports and upstream ports must be unique.
+
 ## Limitations
 
-Windows only (the logon stuff is windows, the doorman is plain node). Your app has to read process.env.PORT, porter tells it which port to use. name.localhost wants port 80 free, falls back to ipv6 if something's on it, or set "namePort": false to skip it.
+Windows only (the logon stuff is windows, the doorman is plain node). Your app
+has to read `process.env.PORT`; Porter tells it which upstream port to use.
+Manifest discovery scans only each configured root and its immediate children.
+Changes to an already loaded manifest require a Porter restart. name.localhost
+wants port 80 free, falls back to IPv6 if something's on it, or set
+`"namePort": false` to skip it.
 
 MIT
