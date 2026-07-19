@@ -7,7 +7,15 @@
 // the server is killed. Closing the browser tab ends its sockets/polling, so
 // the app dies a few minutes later; visiting the URL again resurrects it.
 //
+// Reaping is by idle connections, not by an open tab: a tab that isn't holding
+// a socket (backgrounded, or only polling when visible) doesn't count. An app
+// doing background work with no browser attached can stay alive by pinging
+// GET /_porter/keepalive on its own public port every so often — porter answers
+// that itself (204, no proxy) and resets the idle countdown.
+//
 // Apps must honor PORT from the environment (porter sets PORT=upstreamPort).
+// Porter also sets PUBLIC_PORT (the public door) and PORTER_APP (the name) so
+// an app can reach its own door — e.g. to send the keepalive above.
 //
 // run: node porter.js          (install-startup.ps1 registers it at login)
 import net from 'node:net';
@@ -24,6 +32,16 @@ const LOG_MAX_BYTES = 512 * 1024;
 const SPAWN_TIMEOUT_MS = 20_000;   // max wait for an app to start accepting
 const CONNECT_RETRY_MS = 250;
 const MANIFEST_NAME = 'porter.app.json';
+
+// A GET to this path on any door is answered by porter itself (204, no proxy)
+// and resets the idle countdown. It lets a backgrounded app with no browser
+// attached keep itself alive. See routeAppConnection / answerKeepalive.
+const KEEPALIVE_PATH = '/_porter/keepalive';
+// How long to peek the first chunk for a keepalive request line before giving
+// up and piping raw. Real web clients (HTTP, ws, SSE) speak first, so this
+// fires in about a millisecond; the timeout only matters for the rare app that
+// expects the server to greet first, which we then pipe unchanged.
+const PEEK_MS = 250;
 
 function log(msg) {
   const line = `${new Date().toISOString()} ${msg}\n`;
@@ -222,7 +240,7 @@ function startChild(app) {
     } catch { /* fall back to ignore — logging must never block a spawn */ }
     app.child = spawn(app.cmd, app.args, {
       cwd: app.cwd,
-      env: { ...process.env, ...app.env, PORT: String(app.upstreamPort) },
+      env: { ...process.env, ...app.env, PORT: String(app.upstreamPort), PUBLIC_PORT: String(app.port), PORTER_APP: app.name },
       windowsHide: true,
       stdio: childStdio,
       detached: false,
@@ -268,6 +286,22 @@ function scheduleIdleCheck(app) {
   }, app.idleMs);
 }
 
+function isKeepaliveRequest(chunk) {
+  const head = chunk.toString('latin1', 0, Math.min(chunk.length, 256));
+  const m = head.match(/^[A-Z]+[ \t]+(\/[^ \t\r\n?#]*)/);
+  return m ? m[1] === KEEPALIVE_PATH : false;
+}
+
+function answerKeepalive(app, client) {
+  // Reset the idle countdown without spawning or proxying. This is how an app
+  // doing background work (a radio loop, a cron tick, a long job) tells porter
+  // it's still alive when no browser socket is holding it open. If the app is
+  // down we don't wake it — hitting a real URL does that.
+  clearTimeout(app.idleTimer);
+  scheduleIdleCheck(app);
+  client.end('HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n');
+}
+
 function handleConnection(app, client, initialChunk) {
   clearTimeout(app.idleTimer);
   app.sockets.add(client);
@@ -291,8 +325,32 @@ function handleConnection(app, client, initialChunk) {
     });
 }
 
+// Each app connection is peeked for a keepalive request line before it's piped
+// to the upstream. A real client speaks first, so this resolves in about a
+// millisecond; if nothing arrives by PEEK_MS the app may expect the server to
+// greet first, so we pipe it raw (unchanged from before) rather than deadlock.
+function routeAppConnection(app, client) {
+  client.on('error', () => client.destroy());
+  let settled = false;
+  const onData = chunk => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(peekTimer);
+    client.pause(); // hold further data until the pipe to upstream is up
+    if (isKeepaliveRequest(chunk)) answerKeepalive(app, client);
+    else handleConnection(app, client, chunk);
+  };
+  const peekTimer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    client.removeListener('data', onData);
+    handleConnection(app, client, null);
+  }, PEEK_MS);
+  client.on('data', onData);
+}
+
 function startAppDoor(app, apps) {
-  const server = net.createServer(socket => handleConnection(app, socket));
+  const server = net.createServer(client => routeAppConnection(app, client));
   app.door = server;
   server.on('error', err => {
     if (err.code === 'EADDRINUSE') {
@@ -330,6 +388,10 @@ function startNameDoor(apps, namePort) {
         if (!app) {
           const known = apps.map(a => `  http://${a.name}.localhost/`).join('\n');
           client.end(`HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nporter: no app named "${name}"\nknown apps:\n${known}\n`);
+          return;
+        }
+        if (isKeepaliveRequest(chunk)) {
+          answerKeepalive(app, client);
           return;
         }
         handleConnection(app, client, chunk);
@@ -410,5 +472,6 @@ if (isMain) main();
 export {
   addUniqueApp,
   discoverManifestApps,
+  isKeepaliveRequest,
   normalizeApp,
 };

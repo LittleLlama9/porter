@@ -7,6 +7,7 @@ import test from 'node:test';
 import {
   addUniqueApp,
   discoverManifestApps,
+  isKeepaliveRequest,
   normalizeApp,
 } from './porter.js';
 
@@ -100,5 +101,29 @@ test('rejects invalid manifest settings', () => {
       10,
     ),
     /port must be an integer/,
+  );
+});
+
+
+test('recognizes a keepalive request and nothing else', () => {
+  assert.equal(
+    isKeepaliveRequest(Buffer.from('GET /_porter/keepalive HTTP/1.1\r\n\r\n')),
+    true,
+  );
+  assert.equal(
+    isKeepaliveRequest(Buffer.from('HEAD /_porter/keepalive?ts=1 HTTP/1.1\r\n')),
+    true,
+  );
+  assert.equal(
+    isKeepaliveRequest(Buffer.from('GET / HTTP/1.1\r\nHost: wax\r\n\r\n')),
+    false,
+  );
+  assert.equal(
+    isKeepaliveRequest(Buffer.from('GET /_porter/keepalive-not HTTP/1.1\r\n')),
+    false,
+  );
+  assert.equal(
+    isKeepaliveRequest(Buffer.from('GET /api/_porter/keepalive HTTP/1.1\r\n')),
+    false,
   );
 });
