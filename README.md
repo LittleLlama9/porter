@@ -2,6 +2,10 @@
 
 Makes your localhost apps act like normal sites. You go to the URL, it starts up. You leave, it shuts down after a bit so it's not sitting in the background eating RAM. Come back and it's up again in about a second.
 
+## Download
+
+Grab the latest zip from the [releases page](https://github.com/LittleLlama9/porter/releases/latest), unzip it, and follow How to run below. Or clone the repo if you'd rather track it with git.
+
 ## How it works
 
 For each app it listens on the port you'd normally use. First time you hit it, it spawns the real server hidden on port+10000 and pipes traffic through. HTTP, websockets, SSE all work. After idleMinutes with nothing connected it kills the server. Open the URL and it comes back.
