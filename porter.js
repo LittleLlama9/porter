@@ -30,6 +30,13 @@ const CONFIG_PATH = path.join(__dirname, 'porter.config.json');
 const LOG_PATH = path.join(__dirname, 'porter.log');
 const LOG_MAX_BYTES = 512 * 1024;
 
+// True only when porter.js is the process entry point. When it is imported as a
+// library (the test suite pulls in normalizeApp/addUniqueApp), log() must stay
+// silent: otherwise a test run appends to (and can rotate away) the live
+// porter.log, the very diagnostic trail these logs exist to keep trustworthy.
+const RUNNING_AS_PORTER = !!process.argv[1]
+  && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
 const SPAWN_TIMEOUT_MS = 20_000;   // max wait for an app to start accepting
 const CONNECT_RETRY_MS = 250;
 const MANIFEST_NAME = 'porter.app.json';
@@ -51,6 +58,7 @@ const KEEPALIVE_PATH = '/_porter/keepalive';
 const PEEK_MS = 250;
 
 function log(msg) {
+  if (!RUNNING_AS_PORTER) return;   // imported as a library (tests): stay silent
   const line = `${new Date().toISOString()} ${msg}\n`;
   process.stdout.write(line);
   try {
@@ -95,7 +103,7 @@ function startLagSensor() {
     if (lag >= LAG_LOG_MS && now - lastLog >= STALL_LOG_THROTTLE_MS) {
       lastLog = now;
       const freePct = Math.round((os.freemem() / os.totalmem()) * 100);
-      log(`[watchdog] machine stall — event loop lagged ${Math.round(lag)}ms (mem ${freePct}% free)`);
+      log(`[watchdog] machine stall: event loop lagged ${Math.round(lag)}ms (mem ${freePct}% free)`);
     }
   }, LAG_SAMPLE_MS);
   timer.unref?.();
@@ -307,7 +315,7 @@ function startChild(app) {
       // dying on its own, which earns a context snapshot.
       const clean = code === 0 || child.__deliberate;
       let line = `[${app.name}] exited (code ${code}) after ${uptime}s up`;
-      if (!clean) line += ` [UNEXPECTED — ${sysSnapshot()}]`;
+      if (!clean) line += ` [UNEXPECTED: ${sysSnapshot()}]`;
       log(line);
       if (app.child === child) app.child = null;
     });
@@ -327,7 +335,7 @@ function startChild(app) {
     const totalMs = Date.now() - t0;
     let upLine = `[${app.name}] up on :${app.upstreamPort} in ${(totalMs / 1000).toFixed(1)}s `
       + `(${(createMs / 1000).toFixed(1)}s spawn + ${(bootMs / 1000).toFixed(1)}s boot)`;
-    if (totalMs >= SLOW_SPAWN_MS) upLine += ` [SLOW — ${sysSnapshot()}]`;
+    if (totalMs >= SLOW_SPAWN_MS) upLine += ` [SLOW: ${sysSnapshot()}]`;
     log(upLine);
   })();
   app.starting = starting.finally(() => { app.starting = null; });
@@ -424,7 +432,7 @@ function startAppDoor(app, apps) {
   app.door = server;
   server.on('error', err => {
     if (err.code === 'EADDRINUSE') {
-      log(`[${app.name}] :${app.port} already in use — is the app (or another porter) running? skipping`);
+      log(`[${app.name}] :${app.port} already in use - is the app (or another porter) running? skipping`);
     } else {
       log(`[${app.name}] listen error: ${err.message}`);
     }
@@ -433,7 +441,7 @@ function startAppDoor(app, apps) {
     if (index >= 0) apps.splice(index, 1);
   });
   server.listen(app.port, '127.0.0.1', () => {
-    log(`[${app.name}] door open on :${app.port} → :${app.upstreamPort} (idle ${app.idleMs / 60000}min)`);
+    log(`[${app.name}] door open on :${app.port} -> :${app.upstreamPort} (idle ${app.idleMs / 60000}min)`);
   });
 }
 
@@ -469,13 +477,13 @@ function startNameDoor(apps, namePort) {
     });
     server.on('error', err => {
       if (err.code === 'EADDRINUSE') {
-        log(`[name-door] ${bindHost}:${namePort} already in use — skipping that stack`);
+        log(`[name-door] ${bindHost}:${namePort} already in use - skipping that stack`);
       } else {
         log(`[name-door] ${bindHost}:${namePort} listen error: ${err.message}`);
       }
     });
     server.listen(namePort, bindHost, () => {
-      log(`[name-door] open on ${bindHost}:${namePort} — ${apps.map(a => `${a.name}.localhost`).join(', ')}`);
+      log(`[name-door] open on ${bindHost}:${namePort} - ${apps.map(a => `${a.name}.localhost`).join(', ')}`);
     });
   }
 }
@@ -489,7 +497,7 @@ function main() {
     manifestScanMs,
   } = loadConfig();
   if (apps.length === 0) {
-    log('no apps configured yet — waiting for manifests');
+    log('no apps configured yet - waiting for manifests');
   }
   startLagSensor();
   for (const app of apps) {
@@ -516,7 +524,7 @@ function main() {
   }
 
   const shutdown = () => {
-    log('porter shutting down — stopping children');
+    log('porter shutting down - stopping children');
     for (const app of apps) stopChild(app, 'porter exit');
     setTimeout(() => process.exit(0), 300);
   };
@@ -536,9 +544,7 @@ process.on('unhandledRejection', reason => {
   process.exit(1);
 });
 
-const isMain = process.argv[1]
-  && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (isMain) main();
+if (RUNNING_AS_PORTER) main();
 
 export {
   addUniqueApp,
