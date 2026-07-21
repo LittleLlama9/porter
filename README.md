@@ -4,11 +4,11 @@ Makes your localhost apps act like normal sites. You go to the URL, it starts up
 
 ## Download
 
-1. **Install Node.js** if you don't already have it: go to [nodejs.org](https://nodejs.org), click the big **LTS** button, and install it (just accept the defaults). Porter needs Node 18 or newer.
-2. Grab the latest zip from the [releases page](https://github.com/LittleLlama9/porter/releases/latest) and unzip it anywhere.
-3. Double-click **`install.cmd`**. Porter starts now and every time you log in. To remove it, double-click **`uninstall.cmd`**.
+**Easiest (recommended):** grab **`porter-setup.exe`** from the [releases page](https://github.com/LittleLlama9/porter/releases/latest) and run it. It's a small (~2 MB) installer with a normal wizard: it installs Node.js for you if you don't have it, sets Porter to start at login, and shows up in "Add or remove programs" when you want it gone. No admin needed.
 
-That's the whole setup. Prefer a terminal, or want to track it with git? See How to run below.
+**Or the zip:** grab the latest zip, unzip it anywhere, and double-click **`install.cmd`** (it does the same thing from a console; installs Node via winget if missing). To remove it, double-click **`uninstall.cmd`**.
+
+Either way Porter needs Node.js 18 or newer; both paths install it for you if it's missing. Prefer a terminal, or want to track it with git? See How to run below.
 
 ## How it works
 

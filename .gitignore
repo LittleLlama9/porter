@@ -3,4 +3,5 @@
 logs/
 porter.config.json
 *.superseded
+dist/
 
