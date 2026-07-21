@@ -4,7 +4,11 @@ Makes your localhost apps act like normal sites. You go to the URL, it starts up
 
 ## Download
 
-Grab the latest zip from the [releases page](https://github.com/LittleLlama9/porter/releases/latest), unzip it, and follow How to run below. Or clone the repo if you'd rather track it with git.
+1. **Install Node.js** if you don't already have it: go to [nodejs.org](https://nodejs.org), click the big **LTS** button, and install it (just accept the defaults). Porter needs Node 18 or newer.
+2. Grab the latest zip from the [releases page](https://github.com/LittleLlama9/porter/releases/latest) and unzip it anywhere.
+3. Double-click **`install.cmd`**. Porter starts now and every time you log in. To remove it, double-click **`uninstall.cmd`**.
+
+That's the whole setup. Prefer a terminal, or want to track it with git? See How to run below.
 
 ## How it works
 
@@ -37,16 +41,19 @@ is the tidy version that does no work.
 
 ## How to run
 
+The easy path is double-clicking `install.cmd` (installs and starts). To remove
+it later, double-click `uninstall.cmd`.
+
+Prefer a terminal, or want to run it once in the foreground?
+
 ```
-copy porter.config.example.json porter.config.json
 node porter.js
 ```
 
-Or start it at logon with no admin:
-
-```
-powershell -File install-launch.ps1
-```
+Porter writes an empty `porter.config.json` beside itself on first run, so it
+starts clean. Add your apps to it, or drop a `porter.app.json` in each project
+(see Automatic app manifests below). `install.cmd` just wraps
+`install-launch.ps1`, which registers the hidden logon task with no admin.
 
 Config is just a list of apps:
 

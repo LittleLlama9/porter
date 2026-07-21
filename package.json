@@ -1,0 +1,14 @@
+{
+  "name": "porter",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A tiny zero-dependency doorman for localhost apps.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node porter.test.mjs"
+  }
+}

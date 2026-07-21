@@ -17,7 +17,7 @@
 // Porter also sets PUBLIC_PORT (the public door) and PORTER_APP (the name) so
 // an app can reach its own door — e.g. to send the keepalive above.
 //
-// run: node porter.js          (install-startup.ps1 registers it at login)
+// run: node porter.js          (install.cmd registers it to start at login)
 import net from 'node:net';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -211,8 +211,9 @@ function addUniqueApp(apps, app) {
 
 function loadConfig() {
   if (!fs.existsSync(CONFIG_PATH)) {
-    const example = path.join(__dirname, 'porter.config.example.json');
-    if (fs.existsSync(example)) fs.copyFileSync(example, CONFIG_PATH);
+    // First run: start from a clean, empty config so nothing phantom is
+    // spawned. porter.config.example.json documents every field for reference.
+    fs.writeFileSync(CONFIG_PATH, '{\n  "idleMinutes": 10,\n  "apps": []\n}\n');
   }
   const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
   const idleMinutes = raw.idleMinutes ?? 10;
