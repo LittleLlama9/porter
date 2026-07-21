@@ -19,6 +19,7 @@
 //
 // run: node porter.js          (install-startup.ps1 registers it at login)
 import net from 'node:net';
+import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -32,6 +33,12 @@ const LOG_MAX_BYTES = 512 * 1024;
 const SPAWN_TIMEOUT_MS = 20_000;   // max wait for an app to start accepting
 const CONNECT_RETRY_MS = 250;
 const MANIFEST_NAME = 'porter.app.json';
+
+// diagnostics — cheap, bounded, zero-dependency (see sysSnapshot / startLagSensor)
+const SLOW_SPAWN_MS = 3_000;          // spawns at/over this get a context snapshot
+const LAG_SAMPLE_MS = 1_000;          // event-loop-lag sensor tick
+const LAG_LOG_MS = 500;               // report machine stalls at least this long
+const STALL_LOG_THROTTLE_MS = 10_000; // at most one stall line per this window
 
 // A GET to this path on any door is answered by porter itself (204, no proxy)
 // and resets the idle countdown. It lets a backgrounded app with no browser
@@ -52,6 +59,46 @@ function log(msg) {
     }
     fs.appendFileSync(LOG_PATH, line);
   } catch { /* logging must never kill the porter */ }
+}
+
+// --- diagnostics ---------------------------------------------------------
+// Everything here reuses the bounded log() above (512KB + one .old, ~1MB cap —
+// no new growth path) and writes only on discrete events (a spawn, an odd exit,
+// a machine stall), never per request. The aim is a forensic trail for failure
+// modes we can't foresee, without a heavy or ever-growing debug log.
+
+// Worst event-loop lag seen since the last read. Porter is single-threaded, so
+// when the whole machine is starved of CPU (a game launching, a backup kicking
+// off, anything) porter's own loop fires late — a zero-cost proxy for
+// machine-wide contention. Read-and-reset so a snapshot reflects the recent
+// window.
+let peakLagMs = 0;
+function sysSnapshot() {
+  const freePct = Math.round((os.freemem() / os.totalmem()) * 100);
+  const lag = Math.round(peakLagMs);
+  peakLagMs = 0;
+  return `mem ${freePct}% free, peak loop-lag ${lag}ms`;
+}
+
+// One timer, a subtraction per tick. Logs only when a stall crosses the
+// threshold, throttled so sustained lag can't spam the log. A hard freeze shows
+// up as a single big-lag sample (queued ticks coalesce), so its full duration
+// lands in one line.
+function startLagSensor() {
+  let expected = Date.now() + LAG_SAMPLE_MS;
+  let lastLog = 0;
+  const timer = setInterval(() => {
+    const now = Date.now();
+    const lag = now - expected;
+    expected = now + LAG_SAMPLE_MS;
+    if (lag > peakLagMs) peakLagMs = lag;
+    if (lag >= LAG_LOG_MS && now - lastLog >= STALL_LOG_THROTTLE_MS) {
+      lastLog = now;
+      const freePct = Math.round((os.freemem() / os.totalmem()) * 100);
+      log(`[watchdog] machine stall — event loop lagged ${Math.round(lag)}ms (mem ${freePct}% free)`);
+    }
+  }, LAG_SAMPLE_MS);
+  timer.unref?.();
 }
 
 function normalizeApp(raw, idleMinutes, manifestPath = null) {
@@ -217,7 +264,7 @@ async function waitForUpstream(app) {
       await new Promise(r => setTimeout(r, CONNECT_RETRY_MS));
     }
   }
-  throw new Error(`${app.name}: not accepting on :${app.upstreamPort} after ${SPAWN_TIMEOUT_MS / 1000}s`);
+  throw new Error(`${app.name}: not accepting on :${app.upstreamPort} after ${SPAWN_TIMEOUT_MS / 1000}s [${sysSnapshot()}]`);
 }
 
 function startChild(app) {
@@ -238,6 +285,8 @@ function startChild(app) {
       const fd = fs.openSync(childLog, 'a');
       childStdio = ['ignore', fd, fd];
     } catch { /* fall back to ignore — logging must never block a spawn */ }
+    const t0 = Date.now();
+    let tSpawned = 0;   // when the OS actually created the process ('spawn' event)
     app.child = spawn(app.cmd, app.args, {
       cwd: app.cwd,
       env: { ...process.env, ...app.env, PORT: String(app.upstreamPort), PUBLIC_PORT: String(app.port), PORTER_APP: app.name },
@@ -245,21 +294,40 @@ function startChild(app) {
       stdio: childStdio,
       detached: false,
     });
+    const child = app.child;
+    child.once('spawn', () => { tSpawned = Date.now(); child.__spawnedAt = tSpawned; });
     if (Array.isArray(childStdio)) {
-      app.child.on('exit', () => { try { fs.closeSync(childStdio[1]); } catch { } });
+      child.on('exit', () => { try { fs.closeSync(childStdio[1]); } catch { } });
     }
-    app.child.on('exit', code => {
-      log(`[${app.name}] exited (code ${code})`);
-      app.child = null;
+    child.on('exit', code => {
+      const upFrom = child.__spawnedAt || t0;
+      const uptime = ((Date.now() - upFrom) / 1000).toFixed(1);
+      // clean = normal exit or a stop we asked for; anything else is the app
+      // dying on its own, which earns a context snapshot.
+      const clean = code === 0 || child.__deliberate;
+      let line = `[${app.name}] exited (code ${code}) after ${uptime}s up`;
+      if (!clean) line += ` [UNEXPECTED — ${sysSnapshot()}]`;
+      log(line);
+      if (app.child === child) app.child = null;
     });
-    app.child.on('error', err => {
+    child.on('error', err => {
       log(`[${app.name}] spawn error: ${err.message}`);
-      app.child = null;
+      if (app.child === child) app.child = null;
     });
     // wait until it accepts, then discard the probe socket
     const probe = await waitForUpstream(app);
     probe.destroy();
-    log(`[${app.name}] up on :${app.upstreamPort}`);
+    // Two-phase timing: spawn() -> process exists ('spawn' event) is pure OS
+    // process-creation time (nothing the app does affects it); process exists ->
+    // port accepting is the app's own boot. Splitting them pins a slow start on
+    // the machine vs the app.
+    const createMs = tSpawned ? tSpawned - t0 : 0;
+    const bootMs = tSpawned ? Date.now() - tSpawned : Date.now() - t0;
+    const totalMs = Date.now() - t0;
+    let upLine = `[${app.name}] up on :${app.upstreamPort} in ${(totalMs / 1000).toFixed(1)}s `
+      + `(${(createMs / 1000).toFixed(1)}s spawn + ${(bootMs / 1000).toFixed(1)}s boot)`;
+    if (totalMs >= SLOW_SPAWN_MS) upLine += ` [SLOW — ${sysSnapshot()}]`;
+    log(upLine);
   })();
   app.starting = starting.finally(() => { app.starting = null; });
   return app.starting;
@@ -268,6 +336,7 @@ function startChild(app) {
 function stopChild(app, reason) {
   if (!childAlive(app)) return;
   log(`[${app.name}] stopping (${reason})`);
+  app.child.__deliberate = true;   // mark so the exit handler knows this was us
   const pid = app.child.pid;
   if (process.platform === 'win32') {
     // /T takes the whole tree in case the app spawned helpers
@@ -421,6 +490,7 @@ function main() {
   if (apps.length === 0) {
     log('no apps configured yet — waiting for manifests');
   }
+  startLagSensor();
   for (const app of apps) {
     startAppDoor(app, apps);
   }
